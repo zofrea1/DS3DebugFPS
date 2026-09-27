@@ -32,7 +32,7 @@ Yes, there's a **very** low chance that this bans.
 2020/8/1: Users have reported that the mod is safe to use online without penalization, but please use it at your own discretion!
 
 # Borderless
-With `EnableBorderless` on, the game covers the monitor without a title bar. That includes exclusive fullscreen: the swap chain stays windowed, which is what makes this work with overhauls that ship their own fullscreen setting. Set `EnableBorderless` to 0 to leave the game's own window mode alone.
+`EnableBorderless` applies when the game is in windowed mode. It removes the title bar and covers the monitor, including with overhauls such as Archthrones. Exclusive fullscreen is unchanged. Set `EnableBorderless` to 0 to keep a normal window.
 
 # Cursor Clip - DLL ONLY
 You can now set a hotkey to clip the cursor to the window, this *should* work for those with multiple monitors. 
