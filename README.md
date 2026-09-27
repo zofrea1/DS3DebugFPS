@@ -32,7 +32,7 @@ Yes, there's a **very** low chance that this bans.
 2020/8/1: Users have reported that the mod is safe to use online without penalization, but please use it at your own discretion!
 
 # Borderless
-This will not work in full screen mode, you will need to be in windowed mode (manually set it in game). This DLL will attempt to fullscreen the game in borderless window mode - it will fit screen too!
+With `EnableBorderless` on, the game covers the monitor without a title bar. That includes exclusive fullscreen: the swap chain stays windowed, which is what makes this work with overhauls that ship their own fullscreen setting. Set `EnableBorderless` to 0 to leave the game's own window mode alone.
 
 # Cursor Clip - DLL ONLY
 You can now set a hotkey to clip the cursor to the window, this *should* work for those with multiple monitors. 

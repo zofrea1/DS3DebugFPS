@@ -1,5 +1,6 @@
 #include "dllmain.h"
 #pragma comment(lib, "user32.lib")
+#include <dxgi.h>
 #include "../../external/inih/ini.c"
 #include <stdio.h>
 #include <stdarg.h>
@@ -26,6 +27,15 @@ static int g_flipper_logged = 0;
 static volatile float *g_speed_cave = NULL;
 static float g_speed_cap = 60.f;
 static LONG g_retry_started = 0;
+static HWND g_game_window = NULL;
+static int g_applying_borderless = 0;
+static int g_borderless_logged = 0;
+static BOOL g_fake_fullscreen = FALSE;
+static LONG(WINAPI *g_orig_set_window_long)(HWND, int, LONG) = NULL;
+static HRESULT(WINAPI *g_orig_create_factory)(REFIID, void **) = NULL;
+static HRESULT(WINAPI *g_orig_create_swapchain)(void *, void *, DXGI_SWAP_CHAIN_DESC *, void **) = NULL;
+static HRESULT(WINAPI *g_orig_set_fullscreen)(void *, BOOL, void *) = NULL;
+static HRESULT(WINAPI *g_orig_get_fullscreen)(void *, BOOL *, void **) = NULL;
 
 
 
@@ -518,28 +528,159 @@ static DWORD WINAPI retry_fps(LPVOID unused) {
   return 0;
 }
 
+static int game_window(HWND hwnd) {
+  wchar_t title[64];
+  if (!hwnd || !IsWindow(hwnd)) return 0;
+  if (g_game_window && hwnd == g_game_window) return 1;
+  title[0] = 0;
+  GetWindowTextW(hwnd, title, 64);
+  return wcscmp(title, L"DARK SOULS III") == 0;
+}
+
+/* Same popup the original mod used, plus SWP_FRAMECHANGED so the style survives a
+   mod that switches the swap chain to exclusive fullscreen after startup. */
+static void apply_borderless_window(HWND window) {
+  RECT current;
+  LONG style;
+  if (!configFile.EnableBorderless || g_applying_borderless || !window || !IsWindow(window)) return;
+  g_applying_borderless = 1;
+  g_game_window = window;
+  if (configFile.UseCustomScreenDimensions != 1) {
+    final.right = GetSystemMetrics(SM_CXSCREEN);
+    final.bottom = GetSystemMetrics(SM_CYSCREEN);
+  } else {
+    final.right = configFile.ScreenWidth;
+    final.bottom = configFile.ScreenHeight;
+  }
+  final.left = 0;
+  final.top = 0;
+  style = GetWindowLong(window, GWL_STYLE);
+  if (!GetWindowRect(window, &current) || current.left != 0 || current.top != 0 || current.right != final.right ||
+      current.bottom != final.bottom || (style & (WS_CAPTION | WS_THICKFRAME | WS_BORDER)) != 0 ||
+      (GetWindowLong(window, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0) {
+    SetWindowLong(window, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+    AdjustWindowRect(&final, GetWindowLong(window, GWL_STYLE), FALSE);
+    SetWindowLong(window, GWL_EXSTYLE, GetWindowLong(window, GWL_EXSTYLE) | WS_EX_TOPMOST);
+    SetWindowPos(window, HWND_TOPMOST, final.left, final.top, final.right - final.left, final.bottom - final.top,
+                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    if (!g_borderless_logged) {
+      log_print("[WINDOW] Borderless applied to hwnd %p.", window);
+      g_borderless_logged = 1;
+    }
+  }
+  g_applying_borderless = 0;
+}
+
+static LONG WINAPI hook_set_window_long(HWND hwnd, int index, LONG value) {
+  LONG result;
+  if (configFile.EnableBorderless && game_window(hwnd) && index == GWL_STYLE) {
+    value &= ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_SYSMENU);
+    value |= WS_POPUP | WS_VISIBLE;
+  }
+  result = g_orig_set_window_long(hwnd, index, value);
+  if (configFile.EnableBorderless && game_window(hwnd) && (index == GWL_STYLE || index == GWL_EXSTYLE))
+    apply_borderless_window(hwnd);
+  return result;
+}
+
+static HRESULT WINAPI hook_set_fullscreen(void *swapchain, BOOL fullscreen, void *output) {
+  if (!configFile.EnableBorderless) return g_orig_set_fullscreen(swapchain, fullscreen, output);
+  g_fake_fullscreen = fullscreen;
+  if (g_game_window) apply_borderless_window(g_game_window);
+  if (!g_borderless_logged) log_print("[WINDOW] Ignored exclusive fullscreen request.");
+  return S_OK;
+}
+
+static HRESULT WINAPI hook_get_fullscreen(void *swapchain, BOOL *fullscreen, void **output) {
+  HRESULT result = g_orig_get_fullscreen(swapchain, fullscreen, output);
+  if (configFile.EnableBorderless && SUCCEEDED(result) && fullscreen) *fullscreen = g_fake_fullscreen;
+  return result;
+}
+
+static int patch_vtable(void *object, int index, void *hook, void **original) {
+  void **table;
+  DWORD old = 0;
+  if (!object) return 0;
+  table = *(void ***)object;
+  if (!table) return 0;
+  if (table[index] == hook) return 1;
+  if (!VirtualProtect(&table[index], sizeof(void *), PAGE_READWRITE, &old)) return 0;
+  if (original && !*original) *original = table[index];
+  table[index] = hook;
+  VirtualProtect(&table[index], sizeof(void *), old, &old);
+  return 1;
+}
+
+static HRESULT WINAPI hook_create_swapchain(void *factory, void *device, DXGI_SWAP_CHAIN_DESC *desc, void **swapchain) {
+  HRESULT result;
+  int wanted_fullscreen = desc && !desc->Windowed;
+  if (configFile.EnableBorderless && wanted_fullscreen) {
+    desc->Windowed = TRUE;
+    g_fake_fullscreen = TRUE;
+  }
+  result = g_orig_create_swapchain(factory, device, desc, swapchain);
+  if (SUCCEEDED(result) && configFile.EnableBorderless && swapchain && *swapchain) {
+    patch_vtable(*swapchain, 10, (void *)hook_set_fullscreen, (void **)&g_orig_set_fullscreen);
+    patch_vtable(*swapchain, 11, (void *)hook_get_fullscreen, (void **)&g_orig_get_fullscreen);
+    if (desc && desc->OutputWindow) apply_borderless_window(desc->OutputWindow);
+    if (wanted_fullscreen) log_print("[WINDOW] Swap chain kept windowed for borderless mode.");
+  }
+  return result;
+}
+
+static HRESULT WINAPI hook_create_factory(REFIID iid, void **factory) {
+  HRESULT result = g_orig_create_factory(iid, factory);
+  if (SUCCEEDED(result) && factory && *factory)
+    patch_vtable(*factory, 9, (void *)hook_create_swapchain, (void **)&g_orig_create_swapchain);
+  return result;
+}
+
+static int hook_import(const char *dll_name, const char *function, void *hook, void **original) {
+  GameModule game;
+  IMAGE_DOS_HEADER *dos;
+  IMAGE_NT_HEADERS64 *nt;
+  IMAGE_IMPORT_DESCRIPTOR *import;
+  if (!get_game_module(&game)) return 0;
+  dos = (IMAGE_DOS_HEADER *)game.base;
+  nt = (IMAGE_NT_HEADERS64 *)(game.base + dos->e_lfanew);
+  if (!nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress) return 0;
+  import = (IMAGE_IMPORT_DESCRIPTOR *)(game.base +
+                                      nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+  for (; import->Name; ++import) {
+    const char *name = (const char *)(game.base + import->Name);
+    IMAGE_THUNK_DATA64 *hint;
+    IMAGE_THUNK_DATA64 *iat;
+    if (_stricmp(name, dll_name) != 0) continue;
+    hint = (IMAGE_THUNK_DATA64 *)(game.base + import->OriginalFirstThunk);
+    iat = (IMAGE_THUNK_DATA64 *)(game.base + import->FirstThunk);
+    for (; hint->u1.AddressOfData; ++hint, ++iat) {
+      IMAGE_IMPORT_BY_NAME *entry;
+      DWORD old = 0;
+      if (IMAGE_SNAP_BY_ORDINAL64(hint->u1.Ordinal)) continue;
+      entry = (IMAGE_IMPORT_BY_NAME *)(game.base + hint->u1.AddressOfData);
+      if (strcmp(entry->Name, function) != 0) continue;
+      if (!VirtualProtect(&iat->u1.Function, sizeof(ULONG_PTR), PAGE_READWRITE, &old)) return 0;
+      if (original && !*original) *original = (void *)iat->u1.Function;
+      iat->u1.Function = (ULONG_PTR)hook;
+      VirtualProtect(&iat->u1.Function, sizeof(ULONG_PTR), old, &old);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void install_borderless(void) {
+  int factory = hook_import("dxgi.dll", "CreateDXGIFactory", (void *)hook_create_factory, (void **)&g_orig_create_factory);
+  int style = hook_import("USER32.dll", "SetWindowLongW", (void *)hook_set_window_long, (void **)&g_orig_set_window_long);
+  log_print("[WINDOW] Borderless hooks factory=%d style=%d.", factory, style);
+}
+
 void setFps(float rFPS) {
   HWND window = FindWindowA(NULL, "DARK SOULS III");
   GameModule game;
 
   log_print("[INFO] setFps %g, window %p", rFPS, window);
-  if (configFile.EnableBorderless && window) {
-    log_print("[INFO] Applying borderless window mode");
-    if (configFile.UseCustomScreenDimensions != 1) {
-      final.right = GetSystemMetrics(SM_CXSCREEN);
-      final.bottom = GetSystemMetrics(SM_CYSCREEN);
-    } else {
-      final.right = configFile.ScreenWidth;
-      final.bottom = configFile.ScreenHeight;
-    }
-    final.left = 0;
-    final.top = 0;
-    SetWindowLong(window, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-    AdjustWindowRect(&final, GetWindowLong(window, GWL_STYLE), FALSE);
-    SetWindowLong(window, GWL_EXSTYLE, (GetWindowLong(window, GWL_EXSTYLE) | WS_EX_TOPMOST));
-    MoveWindow(window, final.left, final.top, final.right - final.left, final.bottom - final.top, TRUE);
-    log_print("[INFO] Borderless window mode applied successfully");
-  }
+  if (configFile.EnableBorderless && window) apply_borderless_window(window);
 
   if (!get_game_module(&game)) {
     log_print("[INFO] Game module is not available.");
@@ -577,6 +718,7 @@ BOOL WINAPI DllMain(HINSTANCE baseaddr, DWORD reason, LPVOID reserved) {
         break;
     readFile();
     log_init();
+    if (configFile.EnableBorderless) install_borderless();
     break;
   case DLL_PROCESS_DETACH:
     log_close();
